@@ -1,0 +1,216 @@
+---
+title: "Predicting Movie Ratings — MovieLens 10M"
+subtitle: "HarvardX Data Science Capstone Project"
+author: "Kouramoudou MAGASSOUBA"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+lang: en-US
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+    toc: true
+    toc_depth: 2
+fontsize: 10pt
+geometry: margin=2.5cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5)
+# This document reads saved outputs; it never reruns the training or final evaluation.
+# Locate the project outputs reliably, including when Knit changes directories.
+project_dir <- normalizePath(getwd(), mustWork = TRUE)
+root <- file.path(project_dir, "resultats_movielens")
+required_files <- c("indicateurs.rds", "comparaison_validation.csv", "recherche_lambda.csv",
+                    "distribution_notes.csv", "genres.csv", "films_plus_notes.csv",
+                    "distribution_notes.png", "activite_utilisateurs.png",
+                    "activite_films.png", "popularite_note_moyenne.png",
+                    "comparaison_rmse.png", "optimisation_lambda.png")
+missing_files <- required_files[!file.exists(file.path(root, required_files))]
+if (length(missing_files)) {
+  stop("Missing output files: ", paste(missing_files, collapse = ", "),
+       ". Restore the original saved results; do not rerun the final holdout.")
+}
+indicators <- readRDS(file.path(root, "indicateurs.rds"))
+comparison <- indicators$comparison
+tuning <- indicators$tuning
+distribution <- read.csv(file.path(root, "distribution_notes.csv"))
+genres <- read.csv(file.path(root, "genres.csv"))
+films <- read.csv(file.path(root, "films_plus_notes.csv"), fileEncoding = "UTF-8")
+stopifnot(nrow(comparison) == 5L, nrow(tuning) == 21L,
+          nrow(distribution) > 0L, nrow(films) > 0L)
+model <- as.character(indicators$winner$modele)
+lambda <- as.numeric(indicators$winner$lambda)
+if (is.na(lambda)) lambda <- 0
+rmse_val <- as.numeric(indicators$rmse_validation)
+rmse_final <- as.numeric(indicators$rmse_final)
+n_edx <- indicators$n_edx
+n_holdout <- indicators$n_holdout
+n_train <- indicators$n_train
+n_validation <- indicators$n_validation
+fmt <- function(x, digits = 6) formatC(x, digits = digits, format = "f")
+stopifnot(all(is.finite(c(lambda, rmse_val, rmse_final, n_edx, n_holdout))))
+baseline <- comparison$RMSE_validation[comparison$mode == "global"][1]
+improvement <- baseline - rmse_val
+relative_improvement <- 100 * improvement / baseline
+rating_mode <- distribution$rating[which.max(distribution$nombre)]
+share_high <- 100 * sum(distribution$nombre[distribution$rating >= 4]) / sum(distribution$nombre)
+regular_row <- comparison[comparison$modele == "Regularized", , drop = FALSE]
+genre_row <- comparison[comparison$modele == "Regularized + exact genre combinations", , drop = FALSE]
+genre_gain <- regular_row$RMSE_validation - genre_row$RMSE_validation
+regular_gain <- comparison$RMSE_validation[comparison$modele == "Movie + user effects"][1] - regular_row$RMSE_validation
+holdout_gap <- rmse_final - rmse_val
+n_rating <- sum(distribution$nombre)
+stopifnot(n_rating == n_edx, is.finite(improvement), is.finite(genre_gain),
+          is.finite(regular_gain), is.finite(holdout_gap))
+```
+
+# Executive Summary
+
+This project develops a movie-rating prediction system using the MovieLens 10M dataset. Five model configurations are compared on a validation subset drawn exclusively from `edx`. The final holdout set is not used for model development or hyperparameter selection. The selected model is **`r model`**, with regularization parameter $\lambda = `r fmt(lambda, 1)`$. Its validation RMSE is **`r fmt(rmse_val)`**, and its final RMSE on `final_holdout_test` is **`r fmt(rmse_final)`**.
+
+# Introduction
+
+A movie recommendation system seeks to estimate how a user will rate a movie. The aim is to minimize prediction error while maintaining an independent, reproducible evaluation procedure. We examine a global-mean baseline, movie and user bias models, regularization, and an additional effect for exact genre combinations.
+
+# Data and Evaluation Protocol
+
+MovieLens 10M contains 10,000,054 ratings. The project split produced **`r format(n_edx, big.mark = ",")`** observations in `edx` and **`r format(n_holdout, big.mark = ",")`** in `final_holdout_test`. The internal development split contains **`r format(n_train, big.mark = ",")`** training observations and **`r format(n_validation, big.mark = ",")`** validation observations.
+
+The variables are `userId`, `movieId`, `rating`, `timestamp`, `title`, and `genres`. Every movie and user in the final holdout also appears in `edx`, following the supplied course preparation procedure.
+
+**Strict separation:** all model and hyperparameter choices are based on the internal validation set. The final holdout is evaluated once, after the selected model is refitted on all of `edx`.
+
+# Exploratory Data Analysis
+
+## Rating Distribution
+
+```{r rating-table}
+knitr::kable(distribution, col.names = c("Rating", "Number of ratings"),
+             caption = "Rating distribution in edx")
+```
+
+```{r rating-plot, out.width='95%'}
+knitr::include_graphics(file.path(root, "distribution_notes.png"))
+```
+
+## Movies, Genres, and Activity
+
+```{r top-movies}
+knitr::kable(head(films, 10), col.names = c("Movie ID", "Title", "Number of ratings"),
+             caption = "Ten most frequently rated movies")
+```
+
+```{r genre-table}
+knitr::kable(genres, col.names = c("Genre", "Number of ratings"),
+             caption = "Selected genre frequencies")
+```
+
+The most frequent rating in `edx` is **`r rating_mode`**, and **`r fmt(share_high, 2)`%** of ratings are at least 4. This provides useful context for interpreting the global-mean baseline and the distribution of prediction errors.
+
+Genres are not mutually exclusive: a movie may belong to multiple categories. The genre model uses each movie's **exact genre combination**, not separate coefficients for individual genres.
+
+```{r user-activity, out.width='92%'}
+knitr::include_graphics(file.path(root, "activite_utilisateurs.png"))
+```
+
+```{r movie-activity, out.width='92%'}
+knitr::include_graphics(file.path(root, "activite_films.png"))
+```
+
+```{r popularity, out.width='92%'}
+knitr::include_graphics(file.path(root, "popularite_note_moyenne.png"))
+```
+
+# Methodology
+
+## Evaluation Metric
+
+Root mean squared error (RMSE) is defined as
+
+$$
+\operatorname{RMSE}=\sqrt{\frac{1}{N}\sum_{j=1}^{N}(r_j-\widehat r_j)^2}.
+$$
+
+Lower values indicate better predictive accuracy.
+
+## Candidate Models
+
+The first model predicts the global mean $\widehat r_{ui}=\mu$. The second adds a movie-specific bias $b_i$, and the third also includes a user-specific bias $b_u$:
+
+$$\widehat r_{ui}=\mu+b_i+b_u.$$
+
+Regularization shrinks effects estimated from relatively few observations. For example,
+
+$$
+b_i=\frac{\sum_u(r_{ui}-\mu)}{n_i+\lambda},\qquad
+b_u=\frac{\sum_i(r_{ui}-\mu-b_i)}{n_u+\lambda}.
+$$
+
+The fifth configuration adds a bias $b_g$ for the movie's exact genre combination:
+
+$$\widehat r_{ui}=\mu+b_i+b_u+b_g.$$
+
+Biases are fitted **sequentially**, rather than by joint optimization. The regularization grid runs from 0 to 10 in increments of 0.5. Both the model family and the value of $\lambda$ are selected using validation RMSE only.
+
+# Results
+
+## Validation Model Comparison
+
+```{r results-table}
+knitr::kable(comparison, digits = 6,
+             col.names = c("Model", "Prediction type", "Lambda", "Validation RMSE"),
+             caption = "Model comparison on the internal validation set")
+```
+
+```{r results-plot, out.width='95%'}
+knitr::include_graphics(file.path(root, "comparaison_rmse.png"))
+```
+
+The selected model improves validation RMSE over the global-mean baseline by **`r fmt(improvement)`** points, equivalent to **`r fmt(relative_improvement, 2)`%**. This comparison uses the same internal validation observations and does not rely on the final holdout.
+
+The change in validation RMSE from the unregularized movie-and-user model to its regularized version is **`r fmt(regular_gain)`** points (positive means regularization helped). The difference between the independently tuned regularized model without genres and the version with exact genre combinations is **`r fmt(genre_gain)`** points (positive values favor the genre-augmented model). These are predictive comparisons, not evidence of causal effects.
+
+## Regularization Tuning
+
+```{r tuning-table}
+knitr::kable(tuning, digits = 6,
+             col.names = c("Lambda", "Regularized RMSE", "Genre-augmented RMSE"),
+             caption = "Regularization grid evaluated on the validation set")
+```
+
+```{r tuning-plot, out.width='95%'}
+knitr::include_graphics(file.path(root, "optimisation_lambda.png"))
+```
+
+## Independent Final Holdout Evaluation
+
+After the validation-based selection was finalized, **`r model`** was refitted on all of `edx` with $\lambda = `r fmt(lambda, 1)`$ and applied once to `final_holdout_test`. The resulting RMSE is **`r fmt(rmse_final)`**. The final-minus-validation RMSE difference is **`r fmt(holdout_gap)`** points. This difference is reported descriptively and was not used to revise the model or hyperparameter choices.
+
+# Discussion
+
+The internal validation procedure makes it possible to assess movie and user effects, regularization, and genre-combination effects without consulting the final holdout. The winning model is **`r model`**, with regularization parameter **`r fmt(lambda, 1)`**. Small differences in RMSE should be interpreted cautiously because they depend on the particular internal split.
+
+Movie and user biases account for systematic variation in average movie ratings and users' rating tendencies. Regularization reduces unstable estimates for sparsely rated movies or less active users. The exact genre-combination effect adds another potential predictor, but its contribution should be judged against simpler models on the same validation set.
+
+Predictions are not clipped to the observed rating range of 0.5 to 5. The same prediction rule is used for validation and final testing. The genre variable represents a complete combination of genres, not separate independent genre effects.
+
+Limitations include the absence of latent factors, detailed movie content features, and temporal dynamics. A single internal split is used; the analysis does not provide confidence intervals for the differences in RMSE.
+
+# Conclusion
+
+The project demonstrates a complete workflow: data preparation, exploratory analysis, candidate model fitting, validation-based hyperparameter selection, refitting on `edx`, and a reserved final evaluation. The final holdout RMSE is **`r fmt(rmse_final)`**. The generated CSV files, charts, and session metadata support review and reproduction of the results.
+
+# Reproducibility and References
+
+Run the following command from the directory containing both project files:
+
+```{r command, eval=FALSE, echo=TRUE}
+source("MovieLens_Project.R", encoding = "UTF-8")
+```
+
+The script saves model outputs and renders this R Markdown report to `MovieLens_Report.pdf`. A functioning LaTeX distribution (such as TinyTeX or MacTeX) is required.
+
+**Reproducibility notes:** The script creates a durable marker before final holdout evaluation to guard against accidental repeated testing. If the PDF compilation fails after the model finishes, render this Rmd directly; do not rerun the model script. R and package versions are recorded in `resultats_movielens/session_info.txt`. The `.rds` datasets and intermediate outputs are not part of the three required submission files. The PDF must be produced after actual execution; no RMSE value is hard-coded.
+
+**References:** GroupLens Research, *MovieLens 10M Dataset*; HarvardX, *Data Science Professional Certificate*, MovieLens project; R documentation for `caret`, `dplyr`, `ggplot2`, `knitr`, and `rmarkdown`.
